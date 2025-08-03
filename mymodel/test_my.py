@@ -7,6 +7,9 @@ from torch.autograd import Variable
 from mymodel.embeding import Embedding, PositionalEncoding
 
 
+class TestEmbedding:
+    pass
+
 def test_embedding():
     embedding_dim = 6
     num_embeddings = 10

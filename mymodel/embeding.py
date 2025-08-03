@@ -1,13 +1,14 @@
 import copy
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 import numpy as np
 from torch.autograd import Variable
 
 
 class Embedding(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim):
+    def __init__(self, num_embeddings: int, embedding_dim: int):
         super(Embedding, self).__init__()
         self.embed = nn.Embedding(
             num_embeddings=num_embeddings, embedding_dim=embedding_dim, padding_idx=0
@@ -22,7 +23,7 @@ class Embedding(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, embedding_dim, p_dropout, max_len):
+    def __init__(self, embedding_dim: int, p_dropout=0.1, max_len=512):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=p_dropout)
 
@@ -96,7 +97,7 @@ def clones(module, N):
 
 
 class MutiheaderAttention(nn.Module):
-    def __init__(self, head, embedding_dim, dropout=0.1):
+    def __init__(self, head: int, embedding_dim: int, dropout=0.1):
         # head: 代表几个头的参数
         # embedding 代表词嵌入维度
         super(MutiheaderAttention, self).__init__()
@@ -140,6 +141,220 @@ class MutiheaderAttention(nn.Module):
         )
         # 每个头的计算张量是四维张量，需要转换形状
         # 前面一经将1,2两个维度进行过转置，在这里需要转换回来
-        x = x.transpose(1 ,2).contiguous().view(batch_size, -1, self.head * self.d_k)
+        x = x.transpose(1, 2).contiguous().view(batch_size, -1, self.head * self.d_k)
 
         return self.linears[-1](x)
+
+
+# 需要添加两个全连接层
+class PositionWiseFeedForward(nn.Module):
+    def __init__(self, d_model: int, d_ff: int, dropout=0.1):
+        super(PositionWiseFeedForward, self).__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+# nn.LayerNorm 规范化层：:稳定自注意力层的输出，防止梯度爆炸
+
+# class LayerNorm(nn.Module):
+#     def __init__(self, features, eps=1e-6):
+#         """初始化函数有两个参数，一个是features，表示词嵌入的维度，
+#         另一个是eps它是一个足够小的数，在规范化公式的分母中出现，
+#         防止分母为0."""
+#         super(LayerNorm, self).__init__()
+
+#         # 根据features的形状初始化两个参数张量a2, 和b2, 一个全是0一个全是1
+#         self.a2 = nn.Parameter(torch.ones(features))
+#         self.b2 = nn.Parameter(torch.zeros(features))
+#         self.eps = eps
+
+#     def forward(self, x):
+#         """输入参数x代表来自上一层的输出"""
+#         # 在函数中，首先对输入变量x求其最后一个维度的均值，并保持输出维度和输入维度一致
+#         # 接着再求一个维度的标准差，然后就是根据规范化公式，
+#         mean = x.mean(-1, keepdim=True)
+#         std = x.std(-1, keepdim=True)
+#         return self.a2 * (x - mean) / (std + self.eps) + self.b2
+
+
+class SubLayerConnection(nn.Module):
+    def __init__(self, size, dropout=0.1):
+        # size: 代表词嵌入的维度
+        # dropout：进行Dropout操作的置零比例
+        super(SubLayerConnection, self).__init__()
+        self.norm = nn.LayerNorm(size, eps=1e-6)
+        self.dropout = nn.Dropout(dropout)
+        self.size = size
+
+    def forward(self, x, sublayer):
+        nx = self.norm(x)
+        nx = sublayer(nx)
+        nx = self.dropout(nx)
+        return x + nx
+
+
+class EncoderLayer(nn.Module):
+    def __init__(self, size: int, self_attn, feed_forward, dropout=0.1):
+        """
+        size: 词嵌入维度
+        self_attn: 自注意层实例
+        feed_forward: 前馈前连接层实例
+        """
+        super(EncoderLayer, self).__init__()
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SubLayerConnection(size, dropout), 2)
+        self.size = size
+
+    def forward(self, x, mask):
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
+        return self.sublayer[1](x, self.feed_forward)
+
+
+class Encoder(nn.Module):
+    def __init__(self, layer, N):
+        super(Encoder, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = nn.LayerNorm(layer.size)
+
+    def forward(self, x, mask):
+        for layer in self.layers:
+            x = layer(x, mask)
+        return self.norm(x)
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, size: int, self_attn, src_attn, feed_farward, dropout):
+        """
+        size: 词嵌入维度大小
+        self_attn: 多头自注意力对象Q=K=V
+        src_attn: 多头注意力对象Q!=K=V
+        feed_farward: 前馈前连接层
+        """
+        super(DecoderLayer, self).__init__()
+        self.size = size
+        self.self_attn = self_attn
+        self.src_attn = src_attn
+        self.feed_forward = feed_farward
+        self.sublayer = clones(SubLayerConnection(size, dropout), 3)
+
+    def forward(self, x, memory, source_mask, target_mask):
+        """
+        memory: 语义存储变量
+        source_mask: 源数据掩码张量
+        target_mask: 目标数据掩码张量
+        """
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, target_mask))
+
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, memory, memory, source_mask))
+
+        return self.sublayer[2](x, self.feed_forward)
+
+
+class Decoder(nn.Module):
+    def __init__(self, layer, N):
+        super(Decoder, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = nn.LayerNorm(layer.size)
+
+    def forward(self, x, memory, src_mask, target_mask):
+
+        for layer in self.layers:
+            x = layer(x, lambda: layer(x, memory, src_mask, target_mask))
+
+        return self.norm(x)
+
+
+# 将线性层 + softmax计算层
+class Generator(nn.Module):
+    def __init__(self, d_model: int, vocal_size: int):
+        super(Generator, self).__init__()
+        self.project = nn.Linear(d_model, vocal_size)
+
+    def forward(self, x):
+        x = self.project(x)
+        return F.log_softmax(x, dim=-1)
+
+
+class EncoderDecoder(nn.Module):
+    def __init__(self, encoder, decoder, src_embed, target_embed, generator):
+        super(EncoderDecoder, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_embed = src_embed
+        self.target_embed = target_embed
+        self.generator = generator
+
+    def forward(self, source, target, src_mask, target_mask):
+        memory = self.encode(source, src_mask)
+        return self.decode(memory, src_mask, target, target_mask)
+
+    def encode(self, source, src_mask):
+        x = self.src_embed(source)
+        return self.encoder(x, src_mask)
+
+    def decode(self, memory, src_mask, target, target_mask):
+        x = self.target_embed(target)
+        return self.decoder(x, memory, src_mask, target_mask)
+
+
+def make_model(
+    source_vocab,
+    target_vocab,
+    N=6,
+    d_model=512,
+    d_ff=2048,
+    head=8,
+    max_len=4096,
+    dropout=0.1,
+):
+    # source_vocab: 源数据词汇总数
+    # target_vocab: 代表目标数据的词汇总数
+    # N: 代表编码器和解码器堆叠的层数
+    # d_model: 代表词嵌入的维度
+    # d_ff: 前馈前连接层变换矩阵的维度
+    # head: 多头注意力的头数
+    # dropout
+    dcp = copy.deepcopy
+    attn = MutiheaderAttention(head, d_model)
+    feed_forward = PositionWiseFeedForward(d_model, d_ff, dropout)
+    pe = PositionalEncoding(d_model, p_dropout=dropout, max_len=max_len)
+    encoder = Encoder(EncoderLayer(d_model, dcp(attn), dcp(feed_forward), dropout), N)
+    decoder = Decoder(
+        DecoderLayer(
+            size=d_model,
+            self_attn=dcp(attn),
+            src_attn=dcp(attn),
+            feed_farward=dcp(feed_forward),
+            dropout=dropout,
+        ),
+        N,
+    )
+    generator = Generator(d_model=d_model, vocal_size=target_vocab)
+    model = EncoderDecoder(
+        encoder,
+        decoder,
+        src_embed=nn.Sequential(
+            Embedding(embedding_dim=d_model, num_embeddings=source_vocab), dcp(pe)
+        ),
+        target_embed=nn.Sequential(
+            Embedding(embedding_dim=d_model, num_embeddings=target_vocab), dcp(pe)
+        ),
+        generator=generator,
+    )
+    # 初始化整个模型中的参数， 判断参数的维度大于1，将矩阵初始化为一个服从均匀分布的矩阵
+    for p in model.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p)
+
+    return model
+
+
+print(make_model(source_vocab=11, target_vocab=11))
